@@ -1,0 +1,62 @@
+{
+  "生成时间": "C:\\czc\\MyApplication8\\.claude\\skills\\cangjie-assistant\\scripts",
+  "文档源": {
+    "UI开发和鸿蒙应用 (最高优先级)": {
+      "仓库": "https://gitcode.com/openharmony-sig/docs_cangjie.git",
+      "分支": "master",
+      "源路径": "zh-cn/application-dev",
+      "本地路径": "hm-docs/ui-dev",
+      "适用范围": "所有UI组件、界面开发、用户交互相关问题"
+    },
+    "标准扩展库 (UI组件补充)": {
+      "仓库": "https://gitcode.com/Cangjie/cangjie_stdx.git",
+      "分支": "release/1.0",
+      "源路径": "doc",
+      "本地路径": "hm-docs/stdx",
+      "适用范围": "高级UI组件、扩展功能"
+    },
+    "语法和语言特性": {
+      "仓库": "https://gitcode.com/Cangjie/cangjie_docs.git",
+      "分支": "release/1.0",
+      "源路径": "docs/dev-guide",
+      "本地路径": "hm-docs/syntax",
+      "适用范围": "语法问题、语言特性"
+    },
+    "标准库API": {
+      "仓库": "https://gitcode.com/Cangjie/cangjie_runtime.git",
+      "分支": "release/1.0",
+      "源路径": "std/doc/libs",
+      "本地路径": "hm-docs/stdlib",
+      "适用范围": "基础数据结构、算法"
+    },
+    "命令行工具和构建": {
+      "仓库": "https://gitcode.com/Cangjie/cangjie_docs.git",
+      "分支": "release/1.0",
+      "源路径": "docs/tools",
+      "本地路径": "hm-docs/tools",
+      "适用范围": "构建、打包、工具链问题"
+    }
+  },
+  "文件统计": {
+    "ui-dev": {
+      "总文件数": 1374,
+      "Markdown文件数": 648
+    },
+    "stdx": {
+      "总文件数": 233,
+      "Markdown文件数": 230
+    },
+    "syntax": {
+      "总文件数": 214,
+      "Markdown文件数": 214
+    },
+    "stdlib": {
+      "总文件数": 498,
+      "Markdown文件数": 498
+    },
+    "tools": {
+      "总文件数": 19,
+      "Markdown文件数": 19
+    }
+  }
+}
