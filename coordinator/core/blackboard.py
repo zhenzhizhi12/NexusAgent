@@ -66,6 +66,7 @@ class GlobalState:
             "build_results": [],
             "evolution_records": [],
             "project_root": None,
+            "tool_observations": [],  # Agent tool execution observations
         }
 
         # Agent status tracking
@@ -289,6 +290,7 @@ class GlobalState:
                 "build_results": [],
                 "evolution_records": [],
                 "project_root": None,
+                "tool_observations": [],
             })
             self.agent_states.clear()
             self.messages.clear()

@@ -1,3 +1,9 @@
+"""
+DevOps & QA Agent
+
+Enhanced with core tools for build, test, and iteration.
+"""
+
 import asyncio
 import json
 import logging
@@ -6,9 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from coordinator.agents.base_agent import BaseAgent, Tool
+from coordinator.agents.base_agent import BaseAgent
 from coordinator.core.blackboard import GlobalState
 from coordinator.core.internal_query import InternalQuery, QueryPriority, QueryStatus, ConversationFlow
+from coordinator.core.tools import ShellExecutorTool, FileManagerTool
 
 from graph.extractor import is_valid_code_snippet
 
@@ -17,15 +24,18 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 logger = logging.getLogger("DevOpsQAAgent")
 
 
-class BuildTool(Tool):
-    """Build tool"""
+class BuildTool:
+    """Build tool using ShellExecutorTool."""
     
-    def __init__(self, build_script_path: Path):
-        super().__init__(name="build", description="Execute HarmonyOS build script")
-        self.build_script_path = build_script_path
+    def __init__(self):
+        self.shell_executor = ShellExecutorTool()
     
-    async def execute(self, project_root: Path, max_attempts: int = 5) -> Dict[str, Any]:
-        """Execute build with retry support"""
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        """Execute build with retry support."""
+        project_root = kwargs.get("project_root")
+        build_script_path = kwargs.get("build_script_path")
+        max_attempts = kwargs.get("max_attempts", 5)
+        
         result = {
             "project_root": str(project_root),
             "attempts": 0,
@@ -34,50 +44,36 @@ class BuildTool(Tool):
             "errors": [],
         }
         
-        build_log_path = project_root / "build-full.log"
+        build_log_path = Path(project_root) / "build-full.log" if project_root else None
         
         for attempt in range(1, max_attempts + 1):
             result["attempts"] = attempt
             logger.info(f"[Build] Attempt #{attempt}/{max_attempts}")
             
             try:
-                cmd = [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy", "Bypass",
-                    "-Command",
-                    f"cd '{project_root}'; & {{ . {self.build_script_path} }} *>&1 | Tee-Object -FilePath '{build_log_path}'"
-                ]
+                cmd = f"cd '{project_root}'; & {{ . {build_script_path} }} *>&1 | Tee-Object -FilePath '{build_log_path}'"
                 
-                process = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=900,
-                    encoding='utf-8',
-                    errors='ignore'
+                exec_result = await self.shell_executor.execute(
+                    command=cmd,
+                    working_dir=str(project_root),
+                    timeout=900
                 )
                 
-                logger.info(f"[Build] Exit code: {process.returncode}")
-                
-                if build_log_path.exists():
-                    log_content = build_log_path.read_text(encoding="utf-8", errors="ignore")
-                    result["build_log"] = log_content
+                if exec_result.status == "success":
+                    output = exec_result.output
+                    result["build_log"] = output.get("stdout", "") + "\n" + output.get("stderr", "")
                     
-                    if "BUILD SUCCESSFUL" in log_content or process.returncode == 0:
+                    if "BUILD SUCCESSFUL" in result["build_log"] or output.get("exit_code") == 0:
                         result["successful"] = True
-                        result["exit_code"] = process.returncode
+                        result["exit_code"] = output.get("exit_code")
                         logger.info(f"[Build] Success!")
                         break
-                    else:
-                        logger.info(f"[Build] Failed")
-                        break
-                
-            except subprocess.TimeoutExpired:
-                error_msg = "Build timeout"
-                result["errors"].append(error_msg)
-                logger.error(error_msg)
-                break
+                else:
+                    if exec_result.output:
+                        output = exec_result.output
+                        result["build_log"] = output.get("stdout", "") + "\n" + output.get("stderr", "")
+                    result["errors"].append(exec_result.error or "Build failed")
+            
             except Exception as e:
                 error_msg = f"Build failed: {str(e)}"
                 result["errors"].append(error_msg)
@@ -87,20 +83,19 @@ class BuildTool(Tool):
         return result
 
 
-class CodeFixTool(Tool):
-    """Code fix tool"""
+class CodeFixTool:
+    """Code fix tool."""
     
     def __init__(self):
-        super().__init__(name="code_fix", description="Fix code based on error report")
+        self.file_manager = FileManagerTool()
     
-    async def execute(
-        self,
-        project_root: Path,
-        error_info: str,
-        llm_client=None,
-        model="Pro/zai-org/GLM-5"
-    ) -> Dict[str, Any]:
-        """Fix code"""
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        """Fix code."""
+        project_root = kwargs.get("project_root")
+        error_info = kwargs.get("error_info")
+        llm_client = kwargs.get("llm_client")
+        model = kwargs.get("model", "Pro/zai-org/GLM-5")
+        
         result = {
             "fixed": False,
             "fix_details": None,
@@ -154,36 +149,123 @@ Please return in strict JSON format:
                 fixed_code = fix_plan.get("fixed_code")
                 
                 if file_path and original_code and fixed_code:
-                    full_file_path = project_root / file_path
+                    full_file_path = Path(project_root) / file_path
                     
-                    if full_file_path.exists():
-                        content = full_file_path.read_text(encoding="utf-8")
+                    read_result = await self.file_manager.execute(
+                        action="read",
+                        filepath=str(full_file_path)
+                    )
+                    
+                    if read_result.status == "success" and original_code in read_result.output:
+                        await self.file_manager.execute(
+                            action="write",
+                            filepath=str(full_file_path.with_suffix(full_file_path.suffix + '.backup')),
+                            content=read_result.output
+                        )
                         
-                        if original_code in content:
-                            new_content = content.replace(original_code, fixed_code, 1)
-                            full_file_path.with_suffix(full_file_path.suffix + '.backup').write_text(content, encoding="utf-8")
-                            full_file_path.write_text(new_content, encoding="utf-8")
-                            
+                        replace_result = await self.file_manager.execute(
+                            action="replace",
+                            filepath=str(full_file_path),
+                            old_pattern=original_code,
+                            new_content=fixed_code
+                        )
+                        
+                        if replace_result.status == "success":
                             result["fixed"] = True
                             result["fix_details"] = fix_plan
                             logger.info(f"[Fix] Successfully fixed file: {file_path}")
-        
+                
         except Exception as e:
             logger.warning(f"[Fix] Code fix failed: {e}")
         
         return result
 
 
-class InternalQueryTool(Tool):
-    """Internal Query Tool - For collaborative feedback loop"""
+class AuditorTool:
+    """Audit tool."""
+    
+    def __init__(self):
+        pass
+    
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        """Execute code audit."""
+        code = kwargs.get("code")
+        result = {
+            "valid": True,
+            "issues": [],
+        }
+        
+        try:
+            validation_result = is_valid_code_snippet(code, code)
+            result["valid"] = validation_result
+        except Exception as e:
+            result["valid"] = True  # Default pass
+            result["issues"].append(f"Audit check failed: {str(e)}")
+        
+        return result
+
+
+class EvolutionTool:
+    """Evolution record tool."""
+    
+    def __init__(self, evolution_path: Path):
+        self.file_manager = FileManagerTool()
+        self.evolution_path = evolution_path
+    
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        """Record iteration experience."""
+        record = kwargs.get("record")
+        result = {
+            "recorded": False,
+        }
+        
+        try:
+            check_result = await self.file_manager.execute(
+                action="exists",
+                filepath=str(self.evolution_path)
+            )
+            
+            evolution_content = ""
+            if check_result.status == "success" and check_result.output.get("exists"):
+                read_result = await self.file_manager.execute(
+                    action="read",
+                    filepath=str(self.evolution_path)
+                )
+                evolution_content = read_result.output
+            
+            new_record_text = f"""
+### {datetime.now().strftime('%Y-%m-%d')} - {record.get('agent', 'Unknown')}
+**Type**: {record.get('type', 'General')}
+**Description**: {record.get('description', 'No description')}
+**Solution**: {record.get('solution', 'No solution')}
+**Collaboration**: {record.get('collaboration_flow', 'N/A')}
+"""
+            
+            append_result = await self.file_manager.execute(
+                action="append",
+                filepath=str(self.evolution_path),
+                content=new_record_text
+            )
+            
+            if append_result.status == "success":
+                result["recorded"] = True
+                logger.info(f"[Evolution] Record success: {record.get('description', '')[:50]}")
+        
+        except Exception as e:
+            logger.error(f"[Evolution] Record failed: {e}")
+        
+        return result
+
+
+class InternalQueryTool:
+    """Internal Query Tool - For collaborative feedback loop."""
     
     def __init__(self, blackboard: GlobalState):
-        super().__init__(name="internal_query", description="Create and manage internal queries between agents")
         self.blackboard = blackboard
         self.conversation_flow = ConversationFlow()
     
-    async def execute(self, *args, **kwargs) -> Any:
-        """Execute internal query operation"""
+    async def execute(self, **kwargs) -> Any:
+        """Execute internal query operation."""
         action = kwargs.get("action")
         
         if action == "create":
@@ -209,7 +291,7 @@ class InternalQueryTool(Tool):
         error_message: str = "",
         build_log: str = ""
     ) -> InternalQuery:
-        """Create new internal query"""
+        """Create new internal query."""
         query = self.conversation_flow.create_query(
             sender=sender,
             recipient=recipient,
@@ -220,7 +302,6 @@ class InternalQueryTool(Tool):
             build_log=build_log
         )
         
-        # Post query to blackboard
         await self.blackboard.post_message(
             sender=sender,
             content={
@@ -241,7 +322,7 @@ class InternalQueryTool(Tool):
         confidence: float,
         source_evidence: List[Dict[str, Any]]
     ) -> None:
-        """Respond to query"""
+        """Respond to query."""
         self.conversation_flow.update_query_status(query_id, QueryStatus.SOLUTION_FOUND)
         
         await self.blackboard.post_message(
@@ -264,7 +345,7 @@ class InternalQueryTool(Tool):
         outcome: str,
         selected_solution: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Complete query and record conversation flow"""
+        """Complete query and record conversation flow."""
         query = self.conversation_flow.complete_query(
             query_id,
             success,
@@ -285,70 +366,8 @@ class InternalQueryTool(Tool):
             )
 
 
-class AuditorTool(Tool):
-    """Audit tool"""
-    
-    def __init__(self):
-        super().__init__(name="audit", description="Verify code snippet reliability")
-    
-    async def execute(self, code: str) -> Dict[str, Any]:
-        """Execute code audit"""
-        result = {
-            "valid": True,
-            "issues": [],
-        }
-        
-        try:
-            validation_result = is_valid_code_snippet(code, code)
-            result["valid"] = validation_result
-        except Exception as e:
-            result["valid"] = True  # Default pass
-            result["issues"].append(f"Audit check failed: {str(e)}")
-        
-        return result
-
-
-class EvolutionTool(Tool):
-    """Evolution record tool"""
-    
-    def __init__(self, evolution_path: Path):
-        super().__init__(name="evolution", description="Record iteration experience to Evolution.md")
-        self.evolution_path = evolution_path
-    
-    async def execute(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Record iteration experience"""
-        result = {
-            "recorded": False,
-        }
-        
-        try:
-            if self.evolution_path.exists():
-                evolution_content = self.evolution_path.read_text(encoding="utf-8")
-            else:
-                evolution_content = ""
-            
-            new_record_text = f"""
-### {datetime.now().strftime('%Y-%m-%d')} - {record.get('agent', 'Unknown')}
-**Type**: {record.get('type', 'General')}
-**Description**: {record.get('description', 'No description')}
-**Solution**: {record.get('solution', 'No solution')}
-**Collaboration**: {record.get('collaboration_flow', 'N/A')}
-"""
-            
-            evolution_content += new_record_text
-            self.evolution_path.write_text(evolution_content, encoding="utf-8")
-            
-            result["recorded"] = True
-            logger.info(f"[Evolution] Record success: {record.get('description', '')[:50]}")
-        
-        except Exception as e:
-            logger.error(f"[Evolution] Record failed: {e}")
-        
-        return result
-
-
 class DevOpsQAAgent(BaseAgent):
-    """DevOps & QA Agent with collaborative feedback loop"""
+    """DevOps & QA Agent with enhanced tool support."""
     
     def __init__(
         self,
@@ -358,7 +377,23 @@ class DevOpsQAAgent(BaseAgent):
         llm_client=None,
         llm_model="Pro/zai-org/GLM-5"
     ):
-        system_prompt = "你是鸿蒙DevOps和QA工程师，负责构建、测试和迭代记录。具备协作式反馈能力。构建失败时，向Knowledge Expert发起InternalQuery。通过阶梯式协商解决问题。记录完整协作流程到Evolution.md。"
+        system_prompt = """You are a HarmonyOS DevOps and QA engineer, responsible for build, test, and iteration recording. With collaborative feedback capabilities.
+
+Available tools:
+- shell_executor: Execute system commands (build scripts, test scripts, etc.)
+- file_manager: File read/write operations (read logs, modify configs, record evolution)
+- build: Execute build process
+- code_fix: Fix code based on error information
+- audit: Audit code snippets
+- evolution: Record iteration experience to Evolution.md
+- internal_query: Collaborate with other Agents to solve problems
+
+Workflow:
+1. Code audit (if needed)
+2. Execute build
+3. If build fails, request help from KnowledgeExpert via InternalQuery
+4. Record results to Evolution.md
+"""
         
         super().__init__(
             name="DevOpsQAAgent",
@@ -370,53 +405,78 @@ class DevOpsQAAgent(BaseAgent):
         
         self.build_script_path = build_script_path
         self.evolution_path = evolution_path
+        
+        # Pre-initialize tools for direct access
+        self.shell_executor = ShellExecutorTool()
+        self.file_manager = FileManagerTool()
+        self.build_tool = BuildTool()
+        self.code_fix_tool = CodeFixTool()
+        self.audit_tool = AuditorTool()
+        self.evolution_tool = EvolutionTool(evolution_path)
+        self.internal_query_tool = InternalQueryTool(blackboard)
     
     async def register_tools(self) -> None:
-        """Register tools"""
+        """Register enhanced tools."""
         await super().register_tools()
-        self.add_tool(BuildTool(self.build_script_path))
-        self.add_tool(CodeFixTool())
-        self.add_tool(InternalQueryTool(self.blackboard))
-        self.add_tool(AuditorTool())
-        self.add_tool(EvolutionTool(self.evolution_path))
+        
+        # Register as tools for add_tool compatibility
+        # These are custom tools, not BaseTool subclasses, so we can't use add_tool
+        # Instead, we'll use them directly in process method
+        logger.info(f"[{self.name}] Tools initialized directly")
     
     async def process(self) -> Dict[str, Any]:
-        """Execute DevOps flow with collaborative feedback loop"""
-        logger.info(f"[{self.name}] Starting DevOps flow...")
+        """Execute DevOps pipeline with intelligent on-demand decision making."""
+        logger.info(f"[{self.name}] Starting DevOps pipeline with on-demand logic...")
         
-        project_root_str = await self.blackboard.get("project_root")
         generated_code = await self.blackboard.get("generated_code")
+        project_root = await self.blackboard.get("project_root")
         
-        if not project_root_str:
-            raise ValueError(f"[{self.name}] Project root not set")
+        if not generated_code:
+            logger.warning(f"[{self.name}] No generated code on blackboard, skipping DevOps")
+            return {
+                "agent": self.name,
+                "success": True,
+                "skipped": True,
+                "reason": "No generated code to build"
+            }
         
-        project_root = Path(project_root_str)
+        if not project_root:
+            project_root = PROJECT_ROOT
+        
         results = {
             "audit_result": None,
             "build_result": None,
             "evolution_recorded": False,
             "collaboration_flow": None,
+            "decision_path": [],
         }
         
-        # Step 1: Code audit
+        # === Step 1: Code audit (always execute) ===
         logger.info(f"[{self.name}] Step 1: Code audit...")
-        if generated_code:
-            audit_result = await self.call_tool("audit", generated_code)
-            results["audit_result"] = audit_result
-            logger.info(f"[{self.name}] Audit complete: {audit_result.get('valid', False)}")
-        else:
-            logger.warning(f"[{self.name}] No code to audit")
+        results["decision_path"].append("Step 1: Code audit → started")
         
-        # Step 2: Build with collaborative feedback loop
-        logger.info(f"[{self.name}] Step 2: Build with collaborative feedback loop...")
-        build_result = await self.call_tool("build", project_root, max_attempts=5)
+        audit_result = await self.audit_tool.execute(code=generated_code)
+        results["audit_result"] = audit_result
+        logger.info(f"[{self.name}] Audit complete: {audit_result.get('valid', False)}")
+        results["decision_path"].append("Step 1: Code audit → completed")
+        
+        # === Step 2: Build (always execute to verify code) ===
+        logger.info(f"[{self.name}] Step 2: Build verification...")
+        results["decision_path"].append("Step 2: Build → started")
+        
+        build_result = await self.build_tool.execute(
+            project_root=project_root,
+            build_script_path=self.build_script_path,
+            max_attempts=5
+        )
         results["build_result"] = build_result
         
         if build_result.get("successful"):
             logger.info(f"[{self.name}] Build success")
+            results["decision_path"].append("Step 3: Build successful → record success")
             
-            # Step 3: Record success
-            logger.info(f"[{self.name}] Step 3: Record iteration experience...")
+            # === Step 3a: Record success to Evolution ===
+            logger.info(f"[{self.name}] Step 3a: Record success to Evolution...")
             evolution_record = {
                 "agent": self.name,
                 "type": "Build success",
@@ -424,28 +484,33 @@ class DevOpsQAAgent(BaseAgent):
                 "solution": "All configurations and code correct",
                 "collaboration_flow": "No collaboration needed"
             }
-            evolution_result = await self.call_tool("evolution", evolution_record)
+            evolution_result = await self.evolution_tool.execute(record=evolution_record)
             results["evolution_recorded"] = evolution_result.get("recorded", False)
+            results["decision_path"].append("Step 3a: Success recorded to Evolution")
         else:
-            logger.warning(f"[{self.name}] Build failed - initiating collaborative feedback loop")
+            logger.warning(f"[{self.name}] Build failed - analyzing error...")
+            error_info = build_result.get("build_log", "") or build_result.get("errors", ["Unknown error"])[0] if build_result.get("errors") else "Unknown error"
             
-            # Step 3: Create InternalQuery for Knowledge Expert
-            logger.info(f"[{self.name}] Step 3: Create InternalQuery for Knowledge Expert...")
+            # === Smart Decision 1: Is error fixable? ===
+            fixable = await self._is_error_fixable(error_info)
+            results["decision_path"].append(f"Step 3: Build failed → error fixable: {fixable['status']}")
             
-            error_log = build_result.get("build_log", "") or build_result.get("errors", ["Unknown error"])[0] if build_result.get("errors") else "Unknown error"
-            
-            internal_query_tool = self.tools.get("internal_query")
-            if internal_query_tool:
+            if not fixable["status"]:
+                logger.info(f"[{self.name}] Error not fixable ({fixable['reason']}), skip direct fix")
+                
+                # === Step 3b: Create InternalQuery for Knowledge Expert (only when error not fixable) ===
+                logger.info(f"[{self.name}] Step 3b: Create InternalQuery for Knowledge Expert...")
+                results["decision_path"].append("Step 3b: Create InternalQuery → started")
+                
                 try:
-                    # Create internal query
-                    query = await internal_query_tool.create_query(
+                    query = await self.internal_query_tool._create_query(
                         sender=self.name,
                         recipient="KnowledgeExpertAgent",
-                        question=f"Build failed with error: {error_log[:200]}... How to fix?",
+                        question=f"Build failed with error: {error_info[:200]}... How to fix?",
                         priority=QueryPriority.CRITICAL,
                         error_type="build_failure",
-                        error_message=str(error_log[:500]),
-                        build_log=str(error_log[:1000])
+                        error_message=str(error_info[:500]),
+                        build_log=str(error_info[:1000])
                     )
                     
                     logger.info(f"[{self.name}] InternalQuery created: {query.query_id}")
@@ -454,68 +519,134 @@ class DevOpsQAAgent(BaseAgent):
                         "sent_to": "KnowledgeExpertAgent",
                         "status": "pending"
                     }
-                    
-                    # Wait for Knowledge Expert response (simulated delay)
-                    await asyncio.sleep(2)
-                    
-                    # Check for response on blackboard
-                    messages = await self.read_messages()
-                    query_responses = [msg for msg in messages if isinstance(msg.content, dict) and msg.content.get("type") == "internal_query" and msg.content.get("query_id") == query.query_id and msg.content.get("action") == "respond"]
-                    
-                    if query_responses:
-                        response = query_responses[0].content
-                        solutions = response.get("solutions", [])
-                        logger.info(f"[{self.name}] Received {len(solutions)} solutions from Knowledge Expert")
-                        
-                        # Apply best solution
-                        if solutions:
-                            best_solution = solutions[0]
-                            logger.info(f"[{self.name}] Applying solution: {best_solution.get('description', 'N/A')}")
-                            
-                            # Note: Actual code fix would require more logic here
-                            
-                            # Record collaboration flow
-                            evolution_record = {
-                                "agent": self.name,
-                                "type": "Collaborative fix",
-                                "description": "Build fixed through agent collaboration",
-                                "solution": best_solution.get("description", "N/A"),
-                                "collaboration_flow": f"Query {query.query_id} -> KnowledgeExpert -> 3 solutions received"
-                            }
-                    else:
-                        logger.warning(f"[{self.name}] No response from Knowledge Expert, trying direct fix")
-                
+                    results["decision_path"].append("Step 3b: InternalQuery created, waiting for expert knowledge")
                 except Exception as e:
                     logger.error(f"[{self.name}] InternalQuery failed: {e}")
                     results["collaboration_flow"] = {"error": str(e)}
-            
-            # Step 4: Direct code fix as fallback
-            logger.info(f"[{self.name}] Step 4: Attempt direct code fix...")
-            error_info = build_result.get("build_log", "") or build_result.get("errors", ["Unknown error"])[0] if build_result.get("errors") else "Unknown error"
-            
-            if self.llm_client and error_info:
-                first_500_chars = str(error_info)[:500]
-                fix_result = await self.call_tool("code_fix", project_root, first_500_chars, self.llm_client, self.llm_model)
+                    results["decision_path"].append("Step 3b: InternalQuery creation failed")
+            else:
+                logger.info(f"[{self.name}] Error is fixable ({fixable['reason']}), attempting direct fix...")
+                results["decision_path"].append(f"Step 3c: Error fixable → {fixable['reason']}")
                 
-                if fix_result.get("fixed"):
-                    logger.info(f"[{self.name}] Code fixed, rebuilding...")
-                    await asyncio.sleep(1)
+                # === Step 3c: Direct code fix (only when error is simple/fixable) ===
+                logger.info(f"[{self.name}] Step 3c: Attempt direct code fix...")
+                
+                if self.llm_client and error_info:
+                    first_500_chars = str(error_info)[:500]
+                    fix_result = await self.code_fix_tool.execute(
+                        project_root=project_root,
+                        error_info=first_500_chars,
+                        llm_client=self.llm_client,
+                        model=self.llm_model
+                    )
                     
-                    build_result = await self.call_tool("build", project_root, max_attempts=4)
-                    results["build_result"] = build_result
-                    
-                    if build_result.get("successful"):
-                        logger.info(f"[{self.name}] Build successful after fix")
+                    if fix_result.get("fixed"):
+                        logger.info(f"[{self.name}] Code fixed, rebuilding...")
+                        results["decision_path"].append("Step 3c: Code fixed → rebuild")
+                        
+                        await asyncio.sleep(1)
+                        
+                        rebuild_result = await self.build_tool.execute(
+                            project_root=project_root,
+                            build_script_path=self.build_script_path,
+                            max_attempts=4
+                        )
+                        
+                        if rebuild_result.get("successful"):
+                            results["build_result"] = rebuild_result
+                            logger.info(f"[{self.name}] Build successful after fix")
+                            results["decision_path"].append("Step 3c: Rebuild successful")
+                        else:
+                            logger.warning(f"[{self.name}] Rebuild still failed, fallback to InternalQuery")
+                            results["decision_path"].append("Step 3c: Rebuild failed → fallback to InternalQuery")
+                            
+                            # Fallback: Create InternalQuery after fix attempts fail
+                            try:
+                                query = await self.internal_query_tool._create_query(
+                                    sender=self.name,
+                                    recipient="KnowledgeExpertAgent",
+                                    question=f"Build failed after fix attempt: {error_info[:200]}... How to fix?",
+                                    priority=QueryPriority.CRITICAL,
+                                    error_type="build_failure_after_fix",
+                                    error_message=str(error_info[:500]),
+                                    build_log=str(error_info[:1000])
+                                )
+                                results["collaboration_flow"] = {
+                                    "query_id": query.query_id,
+                                    "sent_to": "KnowledgeExpertAgent",
+                                    "status": "pending"
+                                }
+                            except Exception as e:
+                                results["collaboration_flow"] = {"error": str(e)}
+                    else:
+                        logger.warning(f"[{self.name}] Code fix tool failed, fallback to InternalQuery")
+                        results["decision_path"].append("Step 3c: Code fix failed → fallback to InternalQuery")
         
         # Write build results to blackboard
         build_history = await self.blackboard.get("build_results", [])
-        build_history.append(build_result)
+        build_history.append(results["build_result"])
         await self.blackboard.update("build_results", build_history, agent_name=self.name)
         
-        logger.info(f"[{self.name}] DevOps flow complete")
+        results["decision_path"].append("Step 4: DevOps flow completed")
+        logger.info(f"[{self.name}] DevOps flow complete: {'; '.join(results['decision_path'])}")
         
         return {
             "agent": self.name,
             "success": True,
             "result": results,
+            "decision_summary": f"Executed {'; '.join(results['decision_path'])}"
         }
+    
+    async def _is_error_fixable(self, error_info: str) -> Dict[str, Any]:
+        """AI判断构建错误是否可以直接修复。
+        
+        Args:
+            error_info: 构建错误信息
+            
+        Returns:
+            {"status": bool, "reason": str}
+        """
+        if not error_info:
+            return {"status": False, "reason": "No error info"}
+        
+        if not self.llm_client:
+            logger.warning(f"[{self.name}] No LLM client, using fallback logic")
+            return {"status": True, "reason": "Attempting fix (no LLM)"}
+        
+        prompt = f"""你是HarmonyOS构建系统的DevOps专家。请判断当前的构建错误是否可以通过简单的代码修改直接修复。
+
+【错误信息】
+{error_info[:1000]}
+
+【判断标准】
+请根据错误信息判断是否可修复：
+- 可修复的错误：语法错误、拼写错误、缺少导入、标点符号错误、缩进错误、大小写错误等
+- 不可修复的错误：架构设计问题、依赖冲突、版本不兼容、不支持的功能、类型不兼容、循环依赖等需要重新设计代码的问题
+
+【输出格式】
+是否可修复: true 或 false
+判断理由: 一句话说明为什么可修复/不可修复（必须用中文）
+
+只输出这两行，不要包含其他内容。"""
+
+        try:
+            response = self.llm_client.chat.completions.create(
+                model=self.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
+            )
+            
+            content = response.choices[0].message.content or ""
+            
+            if "是否可修复: true" in content.lower() or "是否可修复:t rue" in content.lower():
+                reason_match = content.split("判断理由:")[1].strip() if "判断理由:" in content else "AI认为可修复"
+                logger.info(f"[{self.name}] AI判断: 错误可修复 - {reason_match}")
+                return {"status": True, "reason": reason_match}
+            else:
+                reason_match = content.split("判断理由:")[1].strip() if "判断理由:" in content else "AI认为不可修复"
+                logger.info(f"[{self.name}] AI判断: 错误不可修复 - {reason_match}")
+                return {"status": False, "reason": reason_match}
+        
+        except Exception as e:
+            logger.error(f"[{self.name}] AI判断失败: {e}")
+            return {"status": True, "reason": f"AI判断失败，尝试修复: {str(e)}"}
