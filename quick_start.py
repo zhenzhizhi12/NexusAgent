@@ -28,9 +28,9 @@ async def main():
         api_key=API_KEY
     )
     
-    # Create coordinator
+    # Create coordinator using async factory method (safe in async context)
     print("🏗️  Creating Multi-Agent Coordinator...")
-    coordinator = MultiAgentCoordinator(
+    coordinator = await MultiAgentCoordinator.create(
         llm_client=llm_client,
         llm_model="Pro/zai-org/GLM-5",
         project_root=PROJECT_ROOT
@@ -50,10 +50,18 @@ async def main():
         print("=" * 60)
         
         for agent_name, agent_result in result["agent_results"].items():
-            status = "✅" if agent_result.get("success") else "❌"
+            if agent_result.get("skipped"):
+                status = "⏭️"
+            elif agent_result.get("success"):
+                status = "✅"
+            else:
+                status = "❌"
             print(f"{status} {agent_name}")
             
-            if not agent_result.get("success"):
+            if agent_result.get("skipped"):
+                reason = agent_result.get("reason", "Unknown reason")
+                print(f"   └─ Skipped: {reason}")
+            elif not agent_result.get("success"):
                 error = agent_result.get("error", "Unknown error")
                 print(f"   └─ Error: {error}")
         

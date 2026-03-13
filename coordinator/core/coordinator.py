@@ -26,6 +26,13 @@ logger = logging.getLogger("MultiAgentCoordinator")
 BASE_URL = "https://api.siliconflow.cn/v1"
 MODEL = "Pro/zai-org/GLM-5"
 
+AGENT_DEPENDENCIES: Dict[str, List[str]] = {
+    "ArchitectAgent": [],
+    "KnowledgeExpertAgent": ["ArchitectAgent"],
+    "CangjieEngineerAgent": ["ArchitectAgent"],
+    "DevOpsQAAgent": ["CangjieEngineerAgent"],
+}
+
 
 class MultiAgentCoordinator:
     """Multi-agent coordinator based on blackboard architecture.
@@ -48,24 +55,74 @@ class MultiAgentCoordinator:
         search_engine=None,
         project_root: Optional[Path] = None,
         llm_client: Optional[OpenAI] = None,
-        llm_model: str = MODEL
+        llm_model: str = MODEL,
+        fail_fast: bool = True
     ):
         self.blackboard = GlobalState()
         self.agents: Dict[str, BaseAgent] = {}
         self.llm_client = llm_client
         self.llm_model = llm_model
         self.search_engine = search_engine
+        self.fail_fast = fail_fast
         
         # Path configuration
         self.build_script_path = PROJECT_ROOT / ".opencode" / "skills" / "cangjie-dev-harmonyos" / "scripts" / "build.ps1"
         self.evolution_path = PROJECT_ROOT / ".opencode" / "skills" / "cangjie-dev-harmonyos" / "Evolution.md"
         
+        # Defer project_root write to async context to avoid asyncio.run() conflicts
+        self._pending_project_root: Optional[Path] = project_root
+        
         # Initialize all agents
         self._initialize_agents()
+
+    @classmethod
+    async def create(
+        cls,
+        search_engine=None,
+        project_root: Optional[Path] = None,
+        llm_client: Optional[OpenAI] = None,
+        llm_model: str = MODEL,
+        fail_fast: bool = True
+    ) -> "MultiAgentCoordinator":
+        """Async factory method — creates an instance and applies pending state safely.
         
-        # If project root exists, configure to blackboard
-        if project_root:
-            asyncio.run(self.blackboard.update("project_root", str(project_root), agent_name="system"))
+        Recommended when creating a coordinator inside an async context (e.g. Jupyter,
+        async main functions). Avoids the RuntimeError raised by asyncio.run() when an
+        event loop is already running.
+        
+        Args:
+            search_engine: Search engine instance
+            project_root: Project root path
+            llm_client: LLM client
+            llm_model: LLM model name
+            fail_fast: Whether to skip downstream agents when a dependency fails
+            
+        Returns:
+            Fully initialized MultiAgentCoordinator
+        """
+        coordinator = cls(
+            search_engine=search_engine,
+            project_root=project_root,
+            llm_client=llm_client,
+            llm_model=llm_model,
+            fail_fast=fail_fast
+        )
+        await coordinator._apply_pending_state()
+        return coordinator
+
+    async def _apply_pending_state(self) -> None:
+        """Write any pending initialization data to the blackboard.
+        
+        Called automatically at the start of run_workflow() so that even coordinators
+        created with the synchronous constructor work correctly.
+        """
+        if self._pending_project_root:
+            await self.blackboard.update(
+                "project_root",
+                str(self._pending_project_root),
+                agent_name="system"
+            )
+            self._pending_project_root = None
     
     def _initialize_agents(self) -> None:
         """Initialize all specialized agents."""
@@ -148,11 +205,15 @@ class MultiAgentCoordinator:
         final_results = {
             "requirement": requirement,
             "agent_results": {},
+            "skipped_agents": [],
             "success": False,
             "errors": [],
         }
         
         try:
+            # Apply any pending initialization state (e.g. project_root)
+            await self._apply_pending_state()
+            
             # Write requirement to blackboard
             await self.blackboard.update("requirement", requirement, agent_name="system")
             
@@ -170,7 +231,25 @@ class MultiAgentCoordinator:
                 "DevOpsQAAgent",
             ]
             
+            failed_agents: set = set()
+            
             for agent_name in execution_order:
+                # fail_fast: skip agent if any of its dependencies failed
+                if self.fail_fast:
+                    deps = AGENT_DEPENDENCIES.get(agent_name, [])
+                    failed_deps = [d for d in deps if d in failed_agents]
+                    if failed_deps:
+                        skip_reason = f"Dependencies failed: {', '.join(failed_deps)}"
+                        logger.warning(f"⏭️ Skipping {agent_name}: {skip_reason}")
+                        final_results["agent_results"][agent_name] = {
+                            "success": False,
+                            "skipped": True,
+                            "reason": skip_reason,
+                        }
+                        final_results["skipped_agents"].append(agent_name)
+                        failed_agents.add(agent_name)
+                        continue
+                
                 logger.info(f"--- Executing {agent_name} ---")
                 
                 agent = self.agents[agent_name]
@@ -183,6 +262,7 @@ class MultiAgentCoordinator:
                         warning_msg = f"{agent_name} execution failed: {result.get('error', 'Unknown error')}"
                         logger.warning(warning_msg)
                         final_results["errors"].append(warning_msg)
+                        failed_agents.add(agent_name)
                 except Exception as e:
                     error_msg = f"{agent_name} execution exception: {str(e)}"
                     logger.error(error_msg, exc_info=True)
@@ -191,8 +271,9 @@ class MultiAgentCoordinator:
                         "success": False,
                         "error": str(e),
                     }
+                    failed_agents.add(agent_name)
             
-            # Check if all agents succeeded
+            # Check if all agents succeeded (skipped agents count as not successful)
             all_success = all(
                 final_results["agent_results"].get(agent_name, {}).get("success", False)
                 for agent_name in execution_order
@@ -261,8 +342,8 @@ async def execute_multi_agent_workflow(
     api_key = os.getenv("SILICONFLOW_API_KEY", "")
     llm_client = OpenAI(base_url=BASE_URL, api_key=api_key) if api_key else None
     
-    # Create coordinator
-    coordinator = MultiAgentCoordinator(
+    # Create coordinator using async factory to avoid asyncio.run() conflicts
+    coordinator = await MultiAgentCoordinator.create(
         search_engine=search_engine,
         project_root=project_root,
         llm_client=llm_client
